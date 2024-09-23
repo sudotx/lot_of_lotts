@@ -7,6 +7,8 @@ declare_id!("CLuTuUqHsE2arQGuTrVN1oYr74mZG1johNFQvmZTj6tW");
 pub mod lottery_system {
     use super::*;
 
+    const ONE_WEEK:i64 = 604800; // 604800 seconds in a week
+
     /// Initializes a new creator pool with the specified pool ID and total tickets.
     ///
     /// This function creates a new creator pool with the given pool ID and total tickets. The total tickets must be between 1 and 10,000 (inclusive).
@@ -22,16 +24,15 @@ pub mod lottery_system {
     /// - `ProgramError` - If there is an error accessing the necessary accounts or updating the creator pool data.
     pub fn initialize_creator_pool(
         ctx: Context<InitializeCreatorPool>,
-        pool_id: u64,
         total_tickets: u64,
     ) -> Result<()> {
-        require!(
-            total_tickets > 0 && total_tickets <= 10000,
-            LotteryError::InvalidTotalTickets
-        );
+        require!(total_tickets > 0, LotteryError::InvalidTotalTickets);
 
         let creator_pool = &mut ctx.accounts.creator_pool;
-        require!(creator_pool.is_active != true, LotteryError::PoolExists);
+
+        let state = &mut ctx.accounts.state;
+        let pool_id = state.next_pool_id;
+        state.next_pool_id += 1;
 
         creator_pool.pool_id = pool_id;
         creator_pool.authority = ctx.accounts.authority.key();
@@ -39,44 +40,30 @@ pub mod lottery_system {
         creator_pool.total_tickets = total_tickets;
         creator_pool.is_active = true;
 
+        // add the new pool ID to the active pools list
+        state.active_pools.push(pool_id);
+
         Ok(())
     }
 
-    /// Accumulates tickets for a user based on their token balance and NFT ownership.
-    ///
-    /// This function calculates the number of tickets a user should receive based on their token balance and the number of NFTs they own. The base number of tickets is calculated by dividing the user's token amount by a fixed value (2 in this case). Then, a bonus is added based on the user's token balance, with 1 bonus ticket per 100 tokens. Finally, an additional bonus is applied based on the number of NFTs the user owns, up to a maximum of 5 NFTs.
-    ///
-    /// The function updates the user's ticket balance, the creator pool's total ticket count, and the creator pool's total fees.
-    ///
-    /// # Arguments
-    /// * `ctx` - The context for the transaction, containing the necessary accounts.
-    /// * `amount` - The amount of tokens the user is using to accumulate tickets.
-    ///
-    /// # Errors
-    /// This function may return the following errors:
-    /// - `ProgramError` - If there is an error accessing the necessary accounts or updating the ticket balances.
     pub fn accumulate_tickets(ctx: Context<BuyTickets>) -> Result<()> {
-        // users dont buy tickets, instead they are allocated tickets based on how much of token volume is owned by the user.
-        // get user token balance
-        let user_token_balance = ctx.accounts.buyer_token_account.amount;
+        let user_trading_volume = ctx.accounts.user_trading_stats.volume;
 
-        // Fetch the value of a dollar in lamports from an oracle
-        // let dollar_value_in_lamports = ctx.get_dollar_value_from_oracle()?;
-        let dollar_value_in_lamports: u64 = 10000000000000 * 2; // since its $2 value needed
+        let dollar_value_in_lamports: u64 = 20_000_000_000_000; // $2 in lamports
 
-        // Calculate tickets based on the current price from the oracle
-        let base_tickets = user_token_balance / dollar_value_in_lamports;
+        // Calculate base tickets based on trading volume
+        // For example, 1 ticket per 100 units of trading volume
+        let base_tickets = user_trading_volume / dollar_value_in_lamports;
 
-        // Calculate bonus tickets based on user's token balance
-        // For example, 1 bonus ticket per 100 tokens
-        let bonus_tickets = user_token_balance / 100;
+        // Calculate bonus tickets
+        let bonus_tickets = user_trading_volume / 100;
 
-        // Calculate total tickets
         let total_tickets = base_tickets + bonus_tickets;
 
-        // let tickets = amount / price;
-        let bonus_multiplier = 1.0 + (0.2 * ctx.accounts.user_nfts.count.min(5) as f64);
-        let final_tickets = (total_tickets as f64 * bonus_multiplier) as u64;
+        // Use integer arithmetic for NFT bonus
+        let nft_bonus = 100 + (20 * ctx.accounts.user_nfts.count.min(5));
+
+        let final_tickets = (total_tickets * nft_bonus as u64) / 100;
 
         // Update user tickets
         let user_tickets = &mut ctx.accounts.user_tickets;
@@ -87,7 +74,7 @@ pub mod lottery_system {
         let creator_pool = &mut ctx.accounts.creator_pool;
         creator_pool.total_tickets += total_tickets;
 
-        msg!("Accumulated {} tickets for user", final_tickets);
+        msg!("Accumulated {} tickets for user", total_tickets);
         Ok(())
     }
 
@@ -115,6 +102,14 @@ pub mod lottery_system {
         require!(
             current_time - creator_pool.last_draw_time >= 4 * 60 * 60,
             LotteryError::DrawTooEarly
+        );
+
+        let state = &mut ctx.accounts.state;
+
+        // checks if the pool id is in the active pools list
+        require!(
+            state.active_pools.contains(&creator_pool.pool_id),
+            LotteryError::PoolNotActive
         );
 
         let seed = current_time as u64;
@@ -198,47 +193,6 @@ pub mod lottery_system {
 
         Ok(())
     }
-    /// Sells tickets to the user, updating their ticket balance and last purchase time.
-    ///
-    /// # Arguments
-    /// * `ctx` - The context for the sell tickets operation, containing the user's ticket account and other necessary accounts.
-    /// * `amount` - The amount of tickets the user wants to purchase.
-    ///
-    /// # Errors
-    /// * `LotteryError::InsufficientBalance` - Returned if the user's ticket balance is less than the requested amount.
-    ///
-    /// # Notes
-    /// - The function includes a commented-out check for whether the user's ticket is void. If uncommented, this would prevent the user from selling a void ticket.
-    /// - The function implements a discount on the ticket price, transferring half the requested amount from the vault token account.
-    pub fn sell_tickets(ctx: Context<SellTickets>, amount: u64) -> Result<()> {
-        let user_tickets = &mut ctx.accounts.user_tickets;
-        require!(
-            user_tickets.balance >= amount,
-            LotteryError::InsufficientBalance
-        );
-
-        require!(user_tickets.is_void == false, LotteryError::VoidTicket);
-        require!(amount > 0, LotteryError::InvalidAmount);
-
-        user_tickets.balance -= amount;
-        user_tickets.last_purchase_time = Clock::get()?.unix_timestamp;
-
-        let discount_amount = amount / 2; // calcuate discount
-        let transfer_instruction = Transfer {
-            from: ctx.accounts.vault_token_account.to_account_info(),
-            to: ctx.accounts.user_token_account.to_account_info(),
-            authority: ctx.accounts.vault_token_account.to_account_info(),
-        };
-        token::transfer(
-            CpiContext::new(
-                ctx.accounts.token_program.to_account_info(),
-                transfer_instruction,
-            ),
-            discount_amount,
-        )?;
-
-        Ok(())
-    }
 
     /// Voids expired tickets and resets the ticket balance and last purchase time.
     ///
@@ -254,61 +208,22 @@ pub mod lottery_system {
     pub fn void_expired_tickets(ctx: Context<VoidExpiredTickets>) -> Result<()> {
         let user_tickets = &mut ctx.accounts.user_tickets;
         let current_time = Clock::get()?.unix_timestamp;
-        let week_ago = current_time - 604800; // 604800 seconds in a week
+        let week_ago = current_time - ONE_WEEK; // 604800 seconds in a week
 
-        if user_tickets.last_purchase_time < week_ago {
-            // Set the isVoid flag on the ticket to true only if expired
+         // Check if tickets are expired
+        if user_tickets.last_purchase_time >= week_ago {
+            msg!("Tickets are not expired for user: {}", user_tickets.user);
+            return Ok(()); // Early return if tickets are not expired
+        }
+
+        // Set the isVoid flag on the ticket to true only if expired
+        if !user_tickets.is_void {
             user_tickets.is_void = true;
             user_tickets.balance = 0; // Reset balance
             user_tickets.last_purchase_time = current_time; // Update last purchase time
-        }
-
-        Ok(())
-    }
-
-    /// Distributes a penalty to eligible users who have not purchased tickets within the last 10 minutes.
-    ///
-    /// # Arguments
-    /// * `ctx` - The context for the distribute penalty operation, containing the user's ticket account.
-    ///
-    /// # Errors
-    /// * None
-    ///
-    /// # Notes
-    /// - This function checks if the user's last ticket purchase was more than 10 minutes ago.
-    /// - If the user is eligible, their ticket balance is increased by the penalty amount, which is the total penalty divided by the number of eligible users.
-    /// - The total penalty is calculated as the sum of the balances of all eligible users.
-    pub fn distribute_penalty(ctx: Context<DistributePenalty>) -> Result<()> {
-        let current_time = Clock::get()?.unix_timestamp;
-        let ten_minutes_ago = current_time - 600; // 600 seconds in 10 minutes
-
-        // will be called every moment post launch to find all jeets, and distribute penalty
-        let mut total_penalty = 0;
-        let mut eligible_users = 0;
-
-        // check if the user is eligible for penalty
-        if ctx.accounts.user_tickets.last_purchase_time < ten_minutes_ago {
-            total_penalty += ctx.accounts.user_tickets.balance;
-            eligible_users += 1;
-        }
-
-        // Iterate through all user tickets to distribute penalties
-        for account in ctx.remaining_accounts.iter() {
-            let user_tickets = Account::<UserTickets>::try_from(account)?;
-            if user_tickets.last_purchase_time < ten_minutes_ago {
-                total_penalty += user_tickets.balance;
-                eligible_users += 1;
-            }
-        }
-
-        // distribute penalty to eligible users
-        if eligible_users > 0 {
-            let penalty_per_user = total_penalty / eligible_users as u64;
-
-            let user_tickets = &mut ctx.accounts.user_tickets;
-            if user_tickets.last_purchase_time >= ten_minutes_ago {
-                user_tickets.balance += penalty_per_user;
-            }
+            msg!("Voided tickets for user: {}", user_tickets.user);
+        } else {
+            msg!("Tickets already voided for user: {}", user_tickets.user);
         }
 
         Ok(())
@@ -337,6 +252,12 @@ pub mod lottery_system {
         );
 
         require!(amount > 0, LotteryError::InvalidAmount); // Ensure amount is positive
+        // ensure pool is active
+        require!(ctx.accounts.creator_pool.is_active, LotteryError::PoolNotActive);
+
+
+        let vault_balance = ctx.accounts.vault_token_account.amount;
+        require!(vault_balance >= amount, LotteryError::InsufficientBalance);
 
         let transfer_instruction = Transfer {
             from: ctx.accounts.vault_token_account.to_account_info(),
@@ -351,6 +272,9 @@ pub mod lottery_system {
             amount,
         )
         .map_err(|_| LotteryError::TransferFailed)?;
+
+
+        msg!("Withdrawn {} from the creator pool by {}", amount, authority.key());
 
         Ok(())
     }
@@ -390,6 +314,7 @@ pub struct InitializeCreatorPool<'info> {
     #[account(mut)]
     pub authority: Signer<'info>,
     pub system_program: Program<'info, System>,
+    pub state: Account<'info, State>,
 }
 
 #[derive(Accounts)]
@@ -411,6 +336,7 @@ pub struct BuyTickets<'info> {
     pub user_nfts: Account<'info, UserNFTs>,
     pub token_program: Program<'info, Token>,
     pub system_program: Program<'info, System>,
+    pub user_trading_stats: Account<'info, UserTradingStats>,
 }
 
 #[derive(Accounts)]
@@ -427,6 +353,7 @@ pub struct DrawLottery<'info> {
     pub fee_wallet: Account<'info, TokenAccount>,
     pub token_program: Program<'info, Token>,
     pub system_program: Program<'info, System>,
+    pub state: Account<'info, State>,
 }
 
 #[derive(Accounts)]
@@ -499,6 +426,22 @@ pub struct UserNFTs {
     pub count: u8,
 }
 
+#[account]
+pub struct State {
+    pub authority: Pubkey,
+    pub next_pool_id: u64,
+    pub active_pools: Vec<u64>,
+}
+
+#[account]
+pub struct UserTradingStats {
+    pub user: Pubkey,
+    pub volume: u64,
+    pub total_tickets_bought: u64,
+    pub total_tickets_sold: u64,
+    pub total_tickets_voided: u64,
+}
+
 #[error_code]
 pub enum LotteryError {
     #[msg("It's too early for the next draw")]
@@ -521,4 +464,6 @@ pub enum LotteryError {
     InvalidAmount,
     #[msg("Transfer Failed")]
     TransferFailed,
+    #[msg("Pool Not Active")]
+    PoolNotActive,
 }
